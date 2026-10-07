@@ -10,6 +10,7 @@
 require 'vpim/vpim'
 require 'vpim/attachment'
 require 'vpim/dirinfo'
+require 'vpim/property_identity'
 
 require 'open-uri'
 require 'stringio'

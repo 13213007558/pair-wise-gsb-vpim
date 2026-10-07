@@ -11,4 +11,5 @@
 
 require 'vpim/icalendar'
 require 'vpim/vcard'
+require 'vpim/property_identity'
 

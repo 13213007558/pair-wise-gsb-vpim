@@ -85,22 +85,26 @@ module Vpim
 
       def Field.value_str(value) # :nodoc:
         line = ''
-        case value
-          when Date
-            line << Vpim.encode_date(value)
+        if value.respond_to?(:encoded_value)
+          line << value.encoded_value
+        else
+          case value
+            when Date
+              line << Vpim.encode_date(value)
 
-          when Time #, DateTime
-            line << Vpim.encode_date_time(value)
+            when Time #, DateTime
+              line << Vpim.encode_date_time(value)
 
-          when Array
-            line << value.map { |v| Field.value_str(v) }.join(';')
+            when Array
+              line << value.map { |v| Field.value_str(v) }.join(';')
 
-          when Symbol
-            line << value
+            when Symbol
+              line << value
 
-          else
-            # FIXME - somewhere along here, values with special chars need escaping...
-            line << value.to_str
+            else
+              # FIXME - somewhere along here, values with special chars need escaping...
+              line << value.to_str
+          end
         end
         line
       end
@@ -207,6 +211,10 @@ module Vpim
       # TODO - need a way to encode String values as TEXT, at least optionally,
       # so as to escape special chars, etc.
       def Field.create(name, value="", params={})
+        if value.respond_to?(:value_type) && !params.any? { |k,_| Vpim::Methods.casecmp?(k.to_s, 'VALUE') }
+          params = params.dup
+          params['VALUE'] = value.value_type
+        end
         line = Field.encode0(nil, name, params, value)
 
         begin
@@ -612,4 +620,3 @@ module Vpim
     end
   end
 end
-

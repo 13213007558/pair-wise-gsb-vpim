@@ -10,6 +10,8 @@
 require 'vpim/vpim'
 require 'vpim/attachment'
 require 'vpim/dirinfo'
+require 'vpim/vcard/value'
+require 'vpim/vcard/converter'
 
 require 'open-uri'
 require 'stringio'
@@ -65,6 +67,13 @@ module Vpim
   # - link:vcf-to-ics.txt: example of how to create calendars of birthdays from vCards
   # - link:vcf-dump.txt: utility for dumping contents of .vcf files
   class Vcard < DirectoryInfo
+    def Vcard.register_value_type(name, *types)
+      Value.register(name, *types)
+    end
+
+    V21 = 21 #:nodoc:
+    V30 = 30 #:nodoc:
+    V40 = 40 #:nodoc:
 
     # Represents the value of an ADR field.
     #
@@ -132,33 +141,50 @@ module Vpim
         @nonstandard = []
       end
 
-      def encode #:nodoc:
-        parts = @@adr_parts.map do |part|
-          instance_variable_get(part)
-        end
+      def value_type
+        'TEXT'
+      end
 
-        value = Vpim.encode_text_list(parts, ";")
+      def components
+        @@adr_parts.map { |part| instance_variable_get(part) }
+      end
 
+      def encoded_value
+        Vpim.encode_text_list(components, ';')
+      end
+
+      def encode(version=V30) #:nodoc:
         params = [ @location, @delivery, @nonstandard ]
-        params << 'pref' if @preferred
-        params = params.flatten.compact.map { |s| s.to_str.downcase }.uniq
-
         paramshash = {}
 
-        paramshash['TYPE'] = params if params.first
+        if version == V40
+          paramshash['VALUE'] = 'TEXT'
+          types = params.flatten.compact.map { |s| s.to_str.upcase }.uniq
+          paramshash['TYPE'] = types if types.first
+          paramshash['PREF'] = '1' if @preferred
+        else
+          params << 'pref' if @preferred
+          types = params.flatten.compact.map { |s| s.to_str.downcase }.uniq
+          paramshash['TYPE'] = types if types.first
+        end
 
-        Vpim::DirectoryInfo::Field.create( 'ADR', value, paramshash)
+        value = version == V40 ? self : encoded_value
+        Vpim::DirectoryInfo::Field.create('ADR', value, paramshash)
       end
 
       def Address.decode(card, field) #:nodoc:
         adr = new
+        version = card.respond_to?(:version_value) ? card.version_value : V30
+        kind = field.kind
+        if kind && (version == V40 ? kind.upcase != 'TEXT' : !['TEXT'].include?(kind.upcase))
+          raise InvalidEncodingError, "VALUE=#{field.kind} is not allowed for ADR"
+        end
 
-        parts = Vpim.decode_text_list(field.value, ';')
+        parts = Vpim.decode_text_list(field.value_raw, ';')
 
         @@adr_parts.each_with_index do |part,i|
           adr.instance_variable_set(part, parts[i] || '')
         end
-
         params = field.pvalues('TYPE')
 
         if params
@@ -180,6 +206,7 @@ module Vpim
             a.uniq!
           end
         end
+        adr.preferred = true if field.pvalue('PREF')
 
         adr
       end
@@ -289,12 +316,18 @@ module Vpim
       # nonstandard types, their meaning is undefined (Array of String). These
       # might be found during decoding, but shouldn't be set during encoding.
       attr_reader :nonstandard
+      # RFC 6350 VALUE type. v4.0 TEL is always URI.
+      attr_reader :value_type
+      # The extension in a tel: URI, if present.
+      attr_reader :extension
 
       def initialize(telephone='') #:nodoc:
         @preferred = false
         @location = []
         @capability = []
         @nonstandard = []
+        @value_type = nil
+        @extension = parse_extension(telephone)
         super(telephone)
       end
 
@@ -307,33 +340,55 @@ module Vpim
         s
       end
 
-      def encode #:nodoc:
+      def encoded_value
+        to_s
+      end
+
+      def encode(version=V30) #:nodoc:
         value = to_str.strip
 
         if value.length < 1
           raise InvalidEncodingError, "TEL must have a value"
         end
 
-        params = [ @location, @capability, @nonstandard ]
-        params << 'pref'  if @preferred
-
-        params = params.flatten.compact.map { |s| s.to_str.downcase }.uniq
-
         paramshash = {}
 
-        paramshash['TYPE'] = params if params.first
+        types = [ @location, @capability, @nonstandard ].flatten.compact
+        types = types.map { |s| s.to_str.downcase }.uniq
 
-        Vpim::DirectoryInfo::Field.create( 'TEL', value, paramshash)
+        if version == V40
+          unless value =~ %r{\Atel:}i
+            raise Unencodeable, "vCard 4.0 TEL must be a tel: URI"
+          end
+          paramshash['VALUE'] = 'URI'
+          paramshash['TYPE'] = types.map(&:upcase) if types.first
+          paramshash['PREF'] = '1' if @preferred
+          Vpim::DirectoryInfo::Field.create('TEL', Value::TelUri.parse(value), paramshash)
+        else
+          types << 'pref' if @preferred
+          paramshash['TYPE'] = types if types.first
+          Vpim::DirectoryInfo::Field.create('TEL', value, paramshash)
+        end
       end
 
-      def Telephone.decode(field) #:nodoc:
-        value = field.to_text.strip
+      def Telephone.decode(field, version=V30) #:nodoc:
+        value = field.value_raw.strip
 
         if value.length < 1
           raise InvalidEncodingError, "TEL must have a value"
         end
 
+        if version == V40
+          kind = field.kind
+          if kind && kind.upcase != 'URI'
+            raise InvalidEncodingError, "VALUE=#{field.kind} is not allowed for TEL"
+          end
+          uri = Value::TelUri.parse(value)
+          value = uri.to_s
+        end
+
         tel = Telephone.new(value)
+        tel.instance_variable_set(:@value_type, version == V40 ? 'URI' : nil)
 
         params = field.pvalues('TYPE')
 
@@ -356,14 +411,24 @@ module Vpim
             a.uniq!
           end
         end
+        tel.instance_variable_set(:@preferred, true) if field.pvalue('PREF')
 
         tel
+      end
+
+      private
+
+      def parse_extension(value)
+        if value =~ %r{\Atel:}i && (match = value.match(/(?:\A|\?|&|;)ext=([^;&?]*)/i))
+          URI.decode_www_form_component(match[1])
+        end
       end
     end
 
     # The name from a vCard, including all the components of the N: and FN:
     # fields.
     class Name
+      N_PARTS = [ :@family, :@given, :@additional, :@prefix, :@suffix ]
       # family name, from N
       attr_accessor :family
       # given name, from N
@@ -378,6 +443,8 @@ module Vpim
       # intended to be in a form more aligned with the cultural conventions of
       # the vCard owner than +formatted+ is.
       attr_accessor :fullname
+      # The five structured TEXT components of N. Components that allow lists
+      # are represented as arrays of String.
       # all the components of N formtted as "#{prefix} #{given} #{additional} #{family}, #{suffix}"
       attr_reader   :formatted
 
@@ -392,24 +459,45 @@ module Vpim
       end
 
       def initialize(n='', fn='') #:nodoc:
-        n = Vpim.decode_text_list(n, ';') do |item|
-          item.strip
+        parts = n.respond_to?(:to_ary) ? n.to_ary : Vpim.decode_text_list(n, ';')
+        N_PARTS.each_with_index do |part, index|
+          instance_variable_set(part, parts[index] || '')
         end
-
-        @family     = n[0] || ""
-        @given      = n[1] || ""
-        @additional = n[2] || ""
-        @prefix     = n[3] || ""
-        @suffix     = n[4] || ""
-
         # FIXME - make calls to #fullname fail if fn is nil
         @fullname = (fn || "").strip
       end
 
-      def encode #:nodoc:
-         Vpim::DirectoryInfo::Field.create('N',
-           Vpim.encode_text_list([ @family, @given, @additional, @prefix, @suffix ].map{|n| n.strip}, ';')
-           )
+      def components
+        N_PARTS.map { |part| instance_variable_get(part) }
+      end
+
+      def Name.decode(field, fn_field=nil) #:nodoc:
+        parts = Vpim.decode_text_list(field.value_raw, ';').map do |part|
+          values = Vpim.decode_text_list(part, ',')
+          values.length == 1 ? values.first : values
+        end
+        name = new(parts)
+        name.fullname = fn_field ? Vpim.decode_text(fn_field.value_raw) : ''
+        name
+      end
+
+      def components=(components)
+        @components = components.to_ary
+        N_PARTS.each_with_index do |part, index|
+          value = @components[index] || ''
+          value = value.join(',') if value.respond_to?(:to_ary)
+          instance_variable_set(part, value)
+        end
+        @components = N_PARTS.map { |part| instance_variable_get(part) }
+      end
+
+      def encode(version=V30) #:nodoc:
+        value = Vpim.encode_text_list(components.map do |component|
+          values = component.respond_to?(:to_ary) ? component.to_ary : [component]
+          values.map { |item| Vpim.encode_text(item.to_s) }.join(',')
+        end, ';')
+        params = version == V40 ? { 'VALUE' => 'TEXT' } : {}
+         Vpim::DirectoryInfo::Field.create('N', value, params)
       end
       def encode_fn #:nodoc:
         fn = @fullname.strip
@@ -425,8 +513,87 @@ module Vpim
       nil
     end
 
+    def field_named(name) #:nodoc:
+      enum_by_name(name).first
+    end
+
+    def version_value #:nodoc:
+      field = field_named('VERSION')
+      return nil unless field
+      case field.value_raw.strip
+      when '2.1'
+        V21
+      when '3.0'
+        V30
+      when '4.0'
+        V40
+      else
+        raise InvalidEncodingError, "unsupported vCard VERSION #{field.value_raw}"
+      end
+    end
+
+    def card_version #:nodoc:
+      version_value || V30
+    end
+
+    def v4? #:nodoc:
+      version_value == V40
+    end
+
+    def validate_version! #:nodoc:
+      version = version_value
+      return unless version
+
+      each do |field|
+        validate_field_for_version(field, version)
+      end
+    end
+
+    def validate_field_for_version(field, version) #:nodoc:
+      name = field.name.upcase
+      return if ['BEGIN', 'END', 'VERSION'].include?(name)
+
+      kind = field.kind && field.kind.upcase
+      definition = Value.registry.definition(name, version)
+
+      if definition
+        if kind
+          unless definition['types'].include?(kind)
+            raise InvalidEncodingError, "VALUE=#{field.kind} is not allowed for #{name} in vCard #{version / 10.0}"
+          end
+        end
+
+        case name
+        when 'TEL'
+          Value::TelUri.parse(field.value_raw.strip) if version == V40
+        when 'GEO'
+          Value::GeoUri.parse(field.value_raw.strip) if version == V40
+        when 'TZ'
+          if version == V40 && (kind.nil? || kind == 'UTC-OFFSET')
+            Value::UtcOffset.parse(field.value_raw.strip)
+          end
+        when 'BDAY', 'ANNIVERSARY'
+          if version == V40
+            Value.parse_as(field.value_raw, kind || definition['default'])
+          end
+        when 'N', 'ADR'
+          expected = name == 'N' ? 5 : 7
+          component_separators = field.value_raw.scan(/(?<!\\);/).length + 1
+          if component_separators > expected
+            raise InvalidEncodingError, "#{name} has too many structured components"
+          end
+        end
+      elsif version == V40 && name =~ /\AX-/ && kind
+        Value.parse_as(field.value_raw, kind)
+      end
+    end
+
     def decode_default(field) #:nodoc:
-      Line.new( field.group, field.name, field.value )
+      if v4? && field.name =~ /\AX-/ && Value.registry.definition(field.name, V40)
+        Line.new(field.group, field.name, Value.decode(field, V40))
+      else
+        Line.new( field.group, field.name, field.value )
+      end
     end
 
     def decode_version(field) #:nodoc:
@@ -438,7 +605,8 @@ module Vpim
     end
 
     def decode_n(field) #:nodoc:
-      Line.new( field.group, field.name, Name.new(field.value, self['FN']).freeze )
+      name = Name.decode(field, field_named('FN'))
+      Line.new(field.group, field.name, name.freeze)
     end
 
     def decode_date_or_datetime(field) #:nodoc:
@@ -452,6 +620,9 @@ module Vpim
     end
 
     def decode_bday(field) #:nodoc:
+      if v4?
+        return Line.new(field.group, field.name, Value.decode(field, V40))
+      end
       begin
         return decode_date_or_datetime(field)
 
@@ -473,12 +644,43 @@ module Vpim
     end
 
     def decode_geo(field) #:nodoc:
+      if v4?
+        kind = field.kind
+        if kind && kind.upcase != 'URI'
+          raise InvalidEncodingError, "VALUE=#{field.kind} is not allowed for GEO"
+        end
+        return Line.new(field.group, field.name, Value::GeoUri.parse(field.value_raw))
+      end
       geo = Vpim.decode_list(field.value_raw, ';') do |item| item.to_f end
       Line.new( field.group, field.name, geo )
     end
 
+    def decode_tz(field) #:nodoc:
+      if v4?
+        type = field.kind && field.kind.upcase
+        if type == 'URI'
+          return Line.new(field.group, field.name, Value::Uri.parse(field.value_raw))
+        elsif type == 'TEXT'
+          return Line.new(field.group, field.name, Value::Text.parse(field.value_raw))
+        elsif type.nil? || type == 'UTC-OFFSET'
+          return Line.new(field.group, field.name, Value::UtcOffset.parse(field.value_raw))
+        else
+          raise InvalidEncodingError, "VALUE=#{field.kind} is not allowed for TZ"
+        end
+      end
+      decode_text(field)
+    end
+
+    def decode_anniversary(field) #:nodoc:
+      if v4?
+        Line.new(field.group, field.name, Value.decode(field, V40))
+      else
+        decode_date_or_datetime(field)
+      end
+    end
+
     def decode_address(field) #:nodoc:
-      Line.new( field.group, field.name, Address.decode(self, field) )
+      Line.new(field.group, field.name, Address.decode(self, field))
     end
 
     def decode_email(field) #:nodoc:
@@ -486,7 +688,19 @@ module Vpim
     end
 
     def decode_telephone(field) #:nodoc:
-      Line.new( field.group, field.name, Telephone.decode(field) )
+      Line.new(field.group, field.name, Telephone.decode(field, card_version))
+    end
+
+    def decode_structured(field) #:nodoc:
+      if v4?
+        kind = field.kind
+        if kind && kind.upcase != 'TEXT'
+          raise InvalidEncodingError, "VALUE=#{field.kind} is not allowed for #{field.name}"
+        end
+        Line.new(field.group, field.name, Vpim.decode_text_list(field.value_raw, ';'))
+      else
+        decode_structured_text(field)
+      end
     end
 
     def decode_list_of_text(field) #:nodoc:
@@ -528,6 +742,7 @@ module Vpim
       'ADR'        => :decode_address,
       'AGENT'      => :decode_agent,
       'BDAY'       => :decode_bday,
+      'ANNIVERSARY' => :decode_anniversary,
       'CATEGORIES' => :decode_list_of_text,
       'EMAIL'      => :decode_email,
       'GEO'        => :decode_geo,
@@ -538,7 +753,7 @@ module Vpim
       'NAME'       => :decode_text,
       'NICKNAME'   => :decode_list_of_text,
       'NOTE'       => :decode_text,
-      'ORG'        => :decode_structured_text,
+      'ORG'        => :decode_structured,
       'PHOTO'      => :decode_attachment,
       'PRODID'     => :decode_text,
       'PROFILE'    => :decode_text,
@@ -548,6 +763,7 @@ module Vpim
       'SOURCE'     => :decode_text,
       'TEL'        => :decode_telephone,
       'TITLE'      => :decode_text,
+      'TZ'         => :decode_tz,
       'UID'        => :decode_text,
       'URL'        => :decode_uri,
       'VERSION'    => :decode_version,
@@ -630,9 +846,33 @@ module Vpim
 
     # Create a vCard 3.0 object with the minimum required fields, plus any
     # +fields+ you want in the card (they can also be added later).
-    def Vcard.create(fields = [] )
-      fields.unshift Field.create('VERSION', "3.0")
+    def Vcard.create(fields = [], version = V30)
+      unless [V21, V30, V40].include?(version)
+        raise ArgumentError, "unsupported vCard version #{version}"
+      end
+      fields = fields.dup
+      unless fields.any? { |field| field.name?('VERSION') }
+        fields.unshift Field.create('VERSION', version == V21 ? '2.1' : version == V40 ? '4.0' : '3.0')
+      end
       super(fields, 'VCARD')
+    end
+
+    def Vcard.create_v4(fields = [])
+      create(fields, V40)
+    end
+
+    # Explicitly create a vCard 4.0 object.
+    def Vcard.create4(fields = [])
+      create_v4(fields)
+    end
+
+    # Explicitly decode vCard 4.0 data. vCard 2.1 and 3.0 data is rejected.
+    def Vcard.decode4(card)
+      cards = decode(card)
+      unless cards.all? { |decoded| decoded.version_value == V40 }
+        raise InvalidEncodingError, 'expected a vCard 4.0 object'
+      end
+      cards
     end
 
     # Decode a collection of vCards into an array of Vcard objects.
@@ -702,7 +942,9 @@ module Vpim
       vcards = []
 
       for e in entities
-        vcards.push(new(e.flatten, 'VCARD'))
+        card = new(e.flatten, 'VCARD')
+        card.validate_version!
+        vcards.push(card)
       end
 
       vcards
@@ -826,6 +1068,11 @@ module Vpim
       value('BDAY')
     end
 
+    # The ANNIVERSARY value. v4.0 returns a typed Text, Uri, or DateAndOrTime.
+    def anniversary
+      value('ANNIVERSARY')
+    end
+
     # The CATEGORIES values, an array of String. A wrapper around
     # #value('CATEGORIES').
     def categories
@@ -852,6 +1099,13 @@ module Vpim
     def geo
       value('GEO')
     end
+
+    # The TZ value. v4.0 preserves TEXT, URI, or UTC-OFFSET typing.
+    def timezone
+      value('TZ')
+    end
+
+    alias tz timezone
 
     # Return an Array of KEY Line#value, or yield each Line#value if a block
     # is given. A wrapper around #values('KEY').
@@ -1059,6 +1313,10 @@ module Vpim
         new(nil, card).make(&block)
       end
 
+      def self.make2_v4(&block) # :yields: maker
+        make2(Vpim::Vcard.create_v4, &block)
+      end
+
       # Deprecated, use #make2.
       #
       # If set, the FN field will be set to +full_name+. Otherwise, FN will
@@ -1096,6 +1354,51 @@ module Vpim
       end
 
       public
+
+      def target_version #:nodoc:
+        @card.version_value || V30
+      end
+
+      def create_date_or_time_field(name, value) #:nodoc:
+        if target_version == V40
+          unless value.respond_to?(:value_type)
+            if value.respond_to?(:strftime)
+              if value.respond_to?(:hour)
+                zone = if value.respond_to?(:zone) && value.zone == 'Z'
+                         'Z'
+                       elsif value.respond_to?(:utc?) && value.utc?
+                         'Z'
+                       elsif value.respond_to?(:offset) && value.offset != 0
+                         format_offset(value.offset)
+                       end
+                value = Vpim::Vcard::Value::DateAndOrTime.date_time(
+                  year: value.year, month: value.month, day: value.day,
+                  hour: value.hour, minute: value.min, second: value.sec, zone: zone)
+              else
+                value = Vpim::Vcard::Value::DateAndOrTime.date(
+                  year: value.year, month: value.month, day: value.day)
+              end
+            else
+              value = Vpim::Vcard::Value::DateAndOrTime.parse(value.to_s)
+            end
+          end
+          DirectoryInfo::Field.create(name, value, 'VALUE' => value.value_type)
+        else
+          unless value.respond_to?(:month)
+            raise ArgumentError, 'birthday must be a date or time object.'
+          end
+          DirectoryInfo::Field.create(name, value)
+        end
+      end
+
+      def format_offset(offset)
+        total = (offset * 86400).to_i
+        sign = total < 0 ? '-' : '+'
+        total = total.abs
+        '%s%02d:%02d' % [sign, total / 3600, (total % 3600) / 60]
+      end
+
+      private :target_version, :create_date_or_time_field, :format_offset
 
       # Deprecated, see #name.
       #
@@ -1144,7 +1447,7 @@ module Vpim
           line.name == 'N'
         end
 
-        @card << x.encode
+        @card << x.encode(target_version)
         @card << x.encode_fn
 
         self
@@ -1156,7 +1459,7 @@ module Vpim
       def add_addr # :yield: address
         x = Vpim::Vcard::Address.new
         yield x
-        @card << x.encode
+        @card << x.encode(target_version)
         self
       end
 
@@ -1169,7 +1472,7 @@ module Vpim
         if block_given?
           yield x
         end
-        @card << x.encode
+        @card << x.encode(target_version)
         self
       end
 
@@ -1202,12 +1505,49 @@ module Vpim
       # Warning: It may confuse both humans and software if you add multiple
       # birthdays.
       def birthday=(birthday)
-        if !birthday.respond_to? :month
-          raise ArgumentError, 'birthday must be a date or time object.'
-        end
         delete_if { |l| l.name == 'BDAY' }
-        @card << Vpim::DirectoryInfo::Field.create( 'BDAY', birthday );
+        @card << create_date_or_time_field('BDAY', birthday)
       end
+
+      def anniversary=(anniversary)
+        delete_if { |l| l.name == 'ANNIVERSARY' }
+        @card << create_date_or_time_field('ANNIVERSARY', anniversary)
+      end
+
+      def add_geo(value)
+        delete_if { |l| l.name == 'GEO' }
+        if target_version == V40
+          uri = value.respond_to?(:value_type) ? value : Vpim::Vcard::Value::GeoUri.parse(value.to_str)
+          @card << DirectoryInfo::Field.create('GEO', uri, 'VALUE' => 'URI')
+        else
+          unless value.respond_to?(:to_ary) && value.to_ary.length == 2
+            raise ArgumentError, 'vCard 2.1/3.0 GEO must be [latitude, longitude]'
+          end
+          @card << DirectoryInfo::Field.create('GEO', value.to_ary.map { |number| number.to_f }.join(';'))
+        end
+        self
+      end
+
+      def add_timezone(value)
+        delete_if { |l| l.name == 'TZ' }
+        typed = if value.respond_to?(:value_type)
+                  value
+                elsif target_version == V40
+                  if value.to_s =~ Value::UtcOffset::OFFSET
+                    Value::UtcOffset.parse(value.to_s)
+                  elsif value.to_s =~ Value::Uri::ABSOLUTE_URI
+                    Value::Uri.parse(value.to_s)
+                  else
+                    Value::Text.encode(value)
+                  end
+                else
+                  value.to_s
+                end
+        @card << DirectoryInfo::Field.create('TZ', typed)
+        self
+      end
+
+      alias add_tz add_timezone
 
       # Add a note field, NOTE. The +note+ String can contain newlines, they
       # will be escaped.
@@ -1426,6 +1766,22 @@ module Vpim
       end
 
     end
+
+    module V4
+      Value = Vcard::Value
+      Maker = Vcard::Maker
+
+      def self.create(fields = [])
+        Vcard.create4(fields)
+      end
+
+      def self.decode(card)
+        Vcard.decode4(card)
+      end
+
+      def self.make2(&block)
+        Maker.make2_v4(&block)
+      end
+    end
   end
 end
-

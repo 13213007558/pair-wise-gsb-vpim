@@ -40,6 +40,156 @@ end:vcard
 
 class TestVcard < Test::Unit::TestCase
 
+  def test_v4_typed_roundtrip
+    card = Vpim::Vcard::V4.make2 do |maker|
+      maker.name do |name|
+        name.family = 'Doe'
+        name.given = 'Jane'
+      end
+      maker.birthday = Vpim::Vcard::Value::DateAndOrTime.month_day(2, 29)
+      maker.add_tel('tel:+1-555-555-0100;ext=1234') do |tel|
+        tel.location = 'work'
+        tel.preferred = true
+      end
+      maker.add_addr do |address|
+        address.street = 'Suite 4; Main Building'
+        address.locality = 'Springfield'
+      end
+    end
+
+    encoded = card.encode(0)
+    assert_match(/\ABEGIN:VCARD\nVERSION:4\.0\n/, encoded)
+    assert_match(/BDAY;VALUE=DATE-AND-OR-TIME:--02-29\n/, encoded)
+    assert_match(/TEL;VALUE=URI;TYPE=WORK;PREF=1:tel:\+1-555-555-0100;ext=1234\n/, encoded)
+    assert_match(/ADR;VALUE=TEXT:;;Suite 4\\; Main Building;Springfield;;;\n/, encoded)
+
+    decoded = Vpim::Vcard::V4.decode(encoded).first
+    birthday = decoded.birthday
+
+    assert_equal('DATE-AND-OR-TIME', birthday.value_type)
+    assert_equal(true, birthday.year_missing?)
+    assert_equal(false, birthday.year_zero?)
+    assert_nil(birthday.year)
+    assert_equal(2, birthday.month)
+    assert_equal(29, birthday.day)
+    assert_nil(birthday.timezone)
+
+    telephone = decoded.telephone
+    assert_equal('URI', telephone.value_type)
+    assert_equal('1234', telephone.extension)
+    assert_equal('uri', decoded.field('TEL').kind)
+    assert_equal(true, telephone.preferred)
+
+    address = decoded.address
+    assert_equal('Suite 4; Main Building', address.street)
+    assert_equal('text', decoded.field('ADR').kind)
+    assert_equal(7, address.components.length)
+
+    name = decoded.name
+    assert_equal(['Doe', 'Jane', '', '', ''], name.components)
+  end
+
+  def test_v4_year_zero_is_not_missing_year
+    birthday = Vpim::Vcard::Value::DateAndOrTime.parse('00000229')
+    assert_equal(0, birthday.year)
+    assert_equal(false, birthday.year_missing?)
+    assert_equal(true, birthday.year_zero?)
+  end
+
+  def test_v4_date_time_does_not_infer_timezone
+    birthday = Vpim::Vcard::Value::DateAndOrTime.parse('20200102T030405')
+    assert_nil(birthday.timezone)
+    assert_equal('20200102T030405', birthday.to_s)
+
+    zoned = Vpim::Vcard::Value::DateAndOrTime.parse('20200102T030405Z')
+    assert_equal('Z', zoned.timezone)
+  end
+
+  def test_v4_geo_tz_and_anniversary_types
+    card = Vpim::Vcard::V4.make2 do |maker|
+      maker.name {}
+      maker.add_geo('geo:37.386013,-122.082932')
+      maker.add_timezone(Vpim::Vcard::Value::Text.encode('Pacific/Auckland'))
+      maker.anniversary = Vpim::Vcard::Value::DateAndOrTime.date(
+        year: 2000, month: 4, day: 15)
+    end
+
+    decoded = Vpim::Vcard::V4.decode(card.encode(0)).first
+    assert_equal('URI', decoded.geo.value_type)
+    assert_in_delta(37.386013, decoded.geo.coordinates.first, 0.000001)
+    assert_equal('TEXT', decoded.timezone.value_type)
+    assert_equal('DATE-AND-OR-TIME', decoded.anniversary.value_type)
+  end
+
+  def test_register_extension_value_types
+    Vpim::Vcard::Value.register('X-DATE', 'DATE-AND-OR-TIME')
+    Vpim::Vcard::Value.register('X-URL', 'URI')
+
+    source = <<~VCF
+      BEGIN:VCARD
+      VERSION:4.0
+      N:;;;;
+      FN:Jane
+      X-DATE:--02-29
+      X-URL:https://example.com/path
+      END:VCARD
+    VCF
+
+    card = Vpim::Vcard::V4.decode(source).first
+    assert_equal('--02-29', card.value('X-DATE').to_s)
+    assert_equal('URI', card.value('X-URL').value_type)
+  end
+
+  def test_explicit_v4_decode_rejects_other_versions
+    v3 = <<~VCF
+      BEGIN:VCARD
+      VERSION:3.0
+      N:;;;;
+      FN:Jane
+      END:VCARD
+    VCF
+
+    assert_raises(InvalidEncodingError) do
+      Vpim::Vcard::V4.decode(v3)
+    end
+  end
+
+  def test_invalid_version_and_value_combinations
+    invalid = <<~VCF
+      BEGIN:VCARD
+      VERSION:4.0
+      N:;;;;
+      FN:Jane
+      TEL;VALUE=TEXT:555-1234
+      END:VCARD
+    VCF
+    assert_raises(InvalidEncodingError) { Vpim::Vcard.decode(invalid) }
+
+    invalid_bday = <<~VCF
+      BEGIN:VCARD
+      VERSION:3.0
+      N:;;;;
+      FN:Jane
+      BDAY;VALUE=URI:https://example.com/birthday
+      END:VCARD
+    VCF
+    assert_raises(InvalidEncodingError) { Vpim::Vcard.decode(invalid_bday) }
+  end
+
+  def test_version_conversion_reports_losses
+    card = Vpim::Vcard::V4.make2 do |maker|
+      maker.name {}
+      maker.birthday = Vpim::Vcard::Value::DateAndOrTime.month_day(2, 29)
+      maker.add_tel('tel:+1-555-555-0100;ext=1234')
+    end
+
+    result = card.convert_version(30)
+    assert_nil(result.card.field('BDAY'))
+    assert_nil(result.card.field('TEL'))
+    assert_equal(['BDAY', 'TEL'], result.losses.map(&:name))
+    assert_equal(['DATE-AND-OR-TIME', 'URI'], result.losses.map(&:value_type))
+  end
+
   # RFC2425 - 8.1. Example 1
   # Note that this is NOT a valid vCard, it lacks BEGIN/END.
   EX1 =<<'EOF'
@@ -1022,4 +1172,3 @@ __
   end
 
 end
-

@@ -261,14 +261,25 @@ module Vpim
     end
   end
 
-  def Vpim.encode_text(v) #:nodoc:
-    v.to_str.gsub(/([\\,;\n])/) { $1 == "\n" ? "\\n" : "\\"+$1 }
+  # Escape a TEXT value. +reserved+ are the list delimiters that must be
+  # escaped in addition to backslash and newline: a comma for
+  # comma-separated lists, a semicolon for structured/semicolon-separated
+  # values, and both for structured values that may themselves be lists
+  # (vCard 4.0 N/ADR components).
+  def Vpim.encode_text(v, reserved = '\,;') #:nodoc:
+    chars = ["\\\\", "\n", reserved].join.chars.uniq.join
+    pattern = Regexp.new("([#{Regexp.escape(chars).gsub('\\\\\\\\', '\\\\')}])")
+    v.to_str.gsub(pattern) { |c| c == "\n" ? "\\n" : "\\"+c }
   end
 
   # v is an Array of String, or just a single String
-  def Vpim.encode_text_list(v, sep = ",") #:nodoc:
+  # When +escape_other+ is true (vCard 4.0 structured values), commas inside
+  # a semicolon-separated list are also escaped, since each component is a
+  # comma-separated list itself.
+  def Vpim.encode_text_list(v, sep = ",", escape_other = false) #:nodoc:
     begin
-      v.to_ary.map{ |t| Vpim.encode_text(t) }.join(sep)
+      extra = (sep == ';' && escape_other) ? ',;' : (sep == ';' ? ';' : ',')
+      v.to_ary.map{ |t| Vpim.encode_text(t, extra) }.join(sep)
     rescue
       Vpim.encode_text(v)
     end
@@ -369,7 +380,6 @@ module Vpim
       end
     end
     return outer, inner
-  end
-
 end
 
+end

@@ -103,6 +103,24 @@ module Vpim
       # might be found during decoding, but shouldn't be set during encoding.
       attr_reader :nonstandard
 
+      # The seven ADR components as nested Arrays of String. Each component
+      # may be a list of values in vCard 4.0 (RFC 6350 6.3.1); populated when
+      # decoding a vCard 4.0. The scalar readers (#street, ...) return the
+      # comma-joined form of the list.
+      attr_reader :components
+
+      # Set the seven component lists and synchronize the scalar readers
+      # (#street, ...) with their comma-joined representation.
+      def components=(parts)
+        unless parts.is_a?(Array) && parts.size == 7
+          raise ArgumentError, 'ADR components must be an Array of seven Arrays'
+        end
+        @components = parts.map { |p| p.is_a?(Array) ? p.map(&:to_s) : [p.to_s] }
+        @@adr_parts.each_with_index do |part, i|
+          instance_variable_set(part, @components[i].join(','))
+        end
+      end
+
       # Used to simplify some long and tedious code. These symbols are in the
       # order required for the ADR field structured TEXT value, the order
       # cannot be changed.
@@ -130,22 +148,48 @@ module Vpim
         @preferred = false
         @delivery = []
         @nonstandard = []
+        @components = nil
       end
 
-      def encode #:nodoc:
-        parts = @@adr_parts.map do |part|
-          instance_variable_get(part)
-        end
+      # Encode ADR for +profile+, either 30 (vCard 2.1/3.0) or 40 (vCard
+      # 4.0). In vCard 4.0 mode the component lists (#components) are
+      # preserved with comma separators, and PREF is emitted as a standalone
+      # parameter rather than as TYPE=pref.
+      def encode(profile=nil) #:nodoc:
+        parts =
+          if profile == 40 && @components
+            @components.map { |component| Vpim.encode_text_list(component, ',') }
+          else
+            @@adr_parts.map do |part|
+              instance_variable_get(part)
+            end
+          end
 
-        value = Vpim.encode_text_list(parts, ";")
+        value =
+          if profile == 40 && @components
+            # Already-encoded component lists; join on the structural
+            # semicolon without double-escaping.
+            parts.join(';')
+          elsif profile == 40
+            # Scalar components: in vCard 4.0 the component-list comma is
+            # also significant and must be escaped.
+            Vpim.encode_text_list(parts, ";", true)
+          else
+            Vpim.encode_text_list(parts, ";", false)
+          end
 
         params = [ @location, @delivery, @nonstandard ]
-        params << 'pref' if @preferred
+
+        use_pref_param = @preferred && profile == 40
+        params << 'pref' if @preferred && !use_pref_param
+
         params = params.flatten.compact.map { |s| s.to_str.downcase }.uniq
 
         paramshash = {}
 
         paramshash['TYPE'] = params if params.first
+
+        paramshash['PREF'] = '1' if use_pref_param
 
         Vpim::DirectoryInfo::Field.create( 'ADR', value, paramshash)
       end
@@ -157,6 +201,16 @@ module Vpim
 
         @@adr_parts.each_with_index do |part,i|
           adr.instance_variable_set(part, parts[i] || '')
+        end
+
+        # In vCard 4.0, each of the seven components can itself be a
+        # comma-separated list (RFC 6350 6.3.1).
+        if card.respond_to?(:profile) && card.profile == 40
+          adr.instance_variable_set(:@components,
+            @@adr_parts.map do |part|
+              Vpim.decode_text_list(adr.instance_variable_get(part), ',')
+            end
+          )
         end
 
         params = field.pvalues('TYPE')
@@ -180,6 +234,9 @@ module Vpim
             a.uniq!
           end
         end
+
+        pref = field.pvalue('PREF')
+        adr.preferred = true if pref && pref != '0'
 
         adr
       end
@@ -278,6 +335,10 @@ module Vpim
     # 2426, but that standard is not freely available. Otherwise, anything that
     # looks like a phone number should be OK.
     class Telephone < String
+      # 'text' or 'uri' (String, or nil if unknown): the VALUE type of the
+      # field. TEL is a TEXT value in vCard 2.1/3.0, and a URI value by
+      # default in vCard 4.0 (see RFC 6350 6.4.1).
+      attr_accessor :value_type
       # true, false (boolean): whether this is the preferred email address
       attr_accessor :preferred
       # home, work, cell, car, pager (Array of String): the location
@@ -291,6 +352,7 @@ module Vpim
       attr_reader :nonstandard
 
       def initialize(telephone='') #:nodoc:
+        @value_type = nil
         @preferred = false
         @location = []
         @capability = []
@@ -314,8 +376,12 @@ module Vpim
           raise InvalidEncodingError, "TEL must have a value"
         end
 
+        is_uri = @value_type == 'uri' || (@value_type.nil? && value.downcase.index('tel:') == 0)
+
         params = [ @location, @capability, @nonstandard ]
-        params << 'pref'  if @preferred
+        # In vCard 2.1/3.0 preference is TYPE=pref; in vCard 4.0 it is the
+        # standalone PREF parameter. URI values are vCard 4.0.
+        params << 'pref' if @preferred && @value_type.nil?
 
         params = params.flatten.compact.map { |s| s.to_str.downcase }.uniq
 
@@ -323,17 +389,34 @@ module Vpim
 
         paramshash['TYPE'] = params if params.first
 
+        paramshash['VALUE'] = is_uri ? 'URI' : 'TEXT' if @value_type
+
+        paramshash['PREF'] = '1' if @preferred && @value_type
+
         Vpim::DirectoryInfo::Field.create( 'TEL', value, paramshash)
       end
 
-      def Telephone.decode(field) #:nodoc:
-        value = field.to_text.strip
+      def Telephone.decode(field, profile=nil) #:nodoc:
+        kind = (field.kind || (profile == 40 ? 'uri' : 'text')).downcase
+
+        case kind
+        when 'uri'
+          value = field.value_raw.strip
+          unless value.downcase =~ /\A#{Vpim::Vcard4::UriValue::GENERIC_URI}\z/
+            raise Vpim::InvalidEncodingError, "TEL;VALUE=URI is not a valid URI (#{value})"
+          end
+        when 'text'
+          value = field.to_text.strip
+        else
+          raise Vpim::InvalidEncodingError, "TEL VALUE=#{kind.upcase} is not allowed (must be URI or TEXT)"
+        end
 
         if value.length < 1
           raise InvalidEncodingError, "TEL must have a value"
         end
 
         tel = Telephone.new(value)
+        tel.value_type = kind
 
         params = field.pvalues('TYPE')
 
@@ -357,6 +440,10 @@ module Vpim
           end
         end
 
+        # vCard 4.0 uses a standalone PREF parameter instead of TYPE=pref.
+        pref = field.pvalue('PREF')
+        tel.preferred = true if pref && pref != '0'
+
         tel
       end
     end
@@ -374,6 +461,11 @@ module Vpim
       attr_accessor :prefix
       # such as "BFA", from N
       attr_accessor :suffix
+      # The N components as nested Arrays of String. Each of the five N
+      # components is itself a list of values in vCard 4.0, e.g. the given
+      # names. This is set when decoding a vCard 4.0; when set, #encode (in
+      # vCard 4.0 mode) emits the comma-separated component lists.
+      attr_accessor :components
       # full name, the FN field. FN is a formatted version of the N field,
       # intended to be in a form more aligned with the cultural conventions of
       # the vCard owner than +formatted+ is.
@@ -392,9 +484,7 @@ module Vpim
       end
 
       def initialize(n='', fn='') #:nodoc:
-        n = Vpim.decode_text_list(n, ';') do |item|
-          item.strip
-        end
+        n = Vpim.decode_text_list(n, ';').map { |item| item.strip }
 
         @family     = n[0] || ""
         @given      = n[1] || ""
@@ -402,14 +492,36 @@ module Vpim
         @prefix     = n[3] || ""
         @suffix     = n[4] || ""
 
+        @components = nil
+
         # FIXME - make calls to #fullname fail if fn is nil
         @fullname = (fn || "").strip
       end
 
-      def encode #:nodoc:
-         Vpim::DirectoryInfo::Field.create('N',
-           Vpim.encode_text_list([ @family, @given, @additional, @prefix, @suffix ].map{|n| n.strip}, ';')
-           )
+      # Encode N for +profile+, either 30 (vCard 2.1/3.0) or 40 (vCard 4.0).
+      # In vCard 4.0 mode, component lists (#components) are emitted as
+      # comma-separated values; otherwise the scalar components are used.
+      def encode(profile=nil) #:nodoc:
+        values =
+          if profile == 40 && @components
+            @components.map do |component|
+              Vpim.encode_text_list(component, ',')
+            end
+          else
+            [ @family, @given, @additional, @prefix, @suffix ].map { |n| n.nil? ? '' : n.strip }
+          end
+
+         value =
+          if profile == 40 && @components
+            # The component lists are already encoded (commas escaped);
+            # a literal semicolon within a component is escaped by the
+            # component-list encoder, so join them directly.
+            values.join(';')
+         else
+            Vpim.encode_text_list(values, ';', profile == 40)
+         end
+
+         Vpim::DirectoryInfo::Field.create('N', value)
       end
       def encode_fn #:nodoc:
         fn = @fullname.strip
@@ -438,7 +550,16 @@ module Vpim
     end
 
     def decode_n(field) #:nodoc:
-      Line.new( field.group, field.name, Name.new(field.value, self['FN']).freeze )
+      name = Name.new(field.value, self['FN'])
+
+      if profile == 40
+        # N's five components are each a comma-separated list in vCard 4.0.
+        name.components = Vpim.decode_text_list(field.value_raw, ';').map do |component|
+          Vpim.decode_text_list(component, ',')
+        end
+      end
+
+      Line.new( field.group, field.name, name.freeze )
     end
 
     def decode_date_or_datetime(field) #:nodoc:
@@ -486,7 +607,7 @@ module Vpim
     end
 
     def decode_telephone(field) #:nodoc:
-      Line.new( field.group, field.name, Telephone.decode(field) )
+      Line.new( field.group, field.name, Telephone.decode(field, profile) )
     end
 
     def decode_list_of_text(field) #:nodoc:
@@ -558,6 +679,32 @@ module Vpim
     # Cache of decoded lines/fields, so we don't have to decode a field more than once.
     attr_reader :cache #:nodoc:
 
+    # The vCard profile as an Integer: 21, 30, 40, or nil if no VERSION
+    # field is present. Unlike #version, this never raises.
+    def profile
+      f = field('VERSION')
+      return nil unless f
+      Vpim::Vcard.version_to_profile(f.value_raw)
+    end
+
+    # Decode dispatch table for this card. vCard 4.0 cards override the
+    # 2.1/3.0 decoding of the typed properties; see Vpim::Vcard4.
+    def decode_table #:nodoc:
+      if profile == 40 && defined?(Vpim::Vcard4::DECODE_V4)
+        table = @@decode.merge(Vpim::Vcard4::DECODE_V4)
+        # Any extension property that registered a value type but isn't in
+        # the static table is decoded through the registry-aware hook.
+        each do |f|
+          if !table.key?(f.name) && Vpim::Vcard4.registered(f.name)
+            table[f.name] = :decode_v4_registered
+          end
+        end
+        table
+      else
+        @@decode
+      end
+    end
+
     # An entry in a vCard. The #value object's type varies with the kind of
     # line (the #name), and on how the line was encoded. The objects returned
     # for a specific kind of line are often extended so that they support a
@@ -576,7 +723,8 @@ module Vpim
       end
 
       def self.decode(decode, card, field) #:nodoc:
-        card.cache[field] || (card.cache[field] = card.send(decode[field.name], field))
+        table = card.decode_table
+        card.cache[field] || (card.cache[field] = card.send(table[field.name], field))
       end
     end
 
@@ -626,6 +774,84 @@ module Vpim
     def initialize(fields, profile) #:nodoc:
       @cache = {}
       super(fields, profile)
+      # Validate that the VALUE parameters used by typed properties are
+      # legal for this vCard version. This is eager (rather than relying on
+      # the field being accessed), so an invalid version/VALUE combination
+      # always produces a clear error when the card is decoded.
+      validate_typed_values!
+    end
+
+    # Convert a VERSION value ("2.1", "3.0", "4.0") to the profile integer
+    # used internally (21, 30, 40). Returns nil for unrecognized values.
+    def Vcard.version_to_profile(value) #:nodoc:
+      case value.to_s.strip
+      when /\A4\.0\z/ then 40
+      when /\A3\.0\z/ then 30
+      when /\A2\.1\z/ then 21
+      else nil
+      end
+    end
+
+    # Validate explicit VALUE parameters against the property's allowed
+    # types for the card version. Known profiles are strict; cards without
+    # a VERSION are accepted leniently (as before).
+    def validate_typed_values! #:nodoc:
+      v = profile
+      return unless v
+
+      if v == 40
+        registry = defined?(Vpim::Vcard4) ? Vpim::Vcard4 : nil
+        registry.validate_card!(self) if registry
+      else
+        validate_typed_values_v23!
+      end
+    end
+
+    def validate_typed_values_v23! #:nodoc:
+      each do |f|
+        next unless f.respond_to?(:kind)
+        kind = f.kind
+        next unless kind
+        name = f.name
+
+        if kind == 'date-and-or-time' || kind == 'utc-offset'
+          raise Vpim::InvalidEncodingError,
+            "#{name};VALUE=#{kind.upcase} is only valid in vCard 4.0, this card is VERSION #{version_value}"
+        end
+
+        if name == 'TEL' && kind == 'uri'
+          raise Vpim::InvalidEncodingError,
+            "TEL;VALUE=URI is not valid in vCard #{version_value}, TEL is a TEXT value"
+        end
+
+        if (name == 'BDAY' || name == 'REV') && kind == 'text'
+          raise Vpim::InvalidEncodingError,
+            "#{name};VALUE=TEXT is not valid in vCard #{version_value}"
+        end
+
+        if (name == 'N' || name == 'ADR') && kind != 'text'
+          raise Vpim::InvalidEncodingError,
+            "#{name} is a structured TEXT value in vCard #{version_value}, got VALUE=#{kind.upcase}"
+        end
+
+        if name == 'GEO' && kind == 'uri'
+          raise Vpim::InvalidEncodingError,
+            "GEO;VALUE=URI is not valid in vCard #{version_value}, GEO is a structured float value"
+        end
+
+        # Properties whose value type was registered for vCard 4.0 only.
+        if defined?(Vpim::Vcard4) && (reg = Vpim::Vcard4.registered_kind(name, kind))
+          unless reg.versions_allowed?(version)
+            raise Vpim::InvalidEncodingError,
+              "#{name};VALUE=#{kind.upcase} is not valid in vCard #{version_value}"
+          end
+        end
+      end
+    end
+
+    def version_value #:nodoc:
+      f = field('VERSION')
+      f ? f.value_raw : '2.1/3.0'
     end
 
     # Create a vCard 3.0 object with the minimum required fields, plus any
@@ -633,6 +859,16 @@ module Vpim
     def Vcard.create(fields = [] )
       fields.unshift Field.create('VERSION', "3.0")
       super(fields, 'VCARD')
+    end
+
+    # Create a vCard 4.0 (RFC 6350) object with the minimum required
+    # fields, plus any +fields+ you want in the card (they can also be added
+    # later). Use Vpim::Vcard::Maker.make4 for a higher-level API.
+    def Vcard.create4(fields = [])
+      fields.unshift Field.create('VERSION', "4.0")
+      fields.unshift Field.create('BEGIN', 'VCARD')
+      fields.push Field.create('END', 'VCARD')
+      new(fields, 'VCARD')
     end
 
     # Decode a collection of vCards into an array of Vcard objects.
@@ -776,7 +1012,7 @@ module Vpim
 
       if fields.first
         line = begin
-                 Line.decode(@@decode, self, fields.first)
+                 Line.decode(decode_table, self, fields.first)
                rescue Vpim::InvalidEncodingError
                end
 
@@ -851,6 +1087,25 @@ module Vpim
     # and RFC2445's description is more complete thant RFC2426.
     def geo
       value('GEO')
+    end
+
+    # The ANNIVERSARY value (vCard 4.0). It is a DateAndOrTime, a String
+    # (VALUE=TEXT), or nil if there is none.
+    def anniversary
+      value('ANNIVERSARY')
+    end
+
+    # The TZ value. In vCard 2.1/3.0 this is a free-form text String (often
+    # a UTC offset). In vCard 4.0 it may be a String (VALUE=TEXT), an
+    # Attachment::Uri (VALUE=URI), or a DateAndOrTime/UtcOffset
+    # (VALUE=UTC-OFFSET), see RFC 6350 6.5.1.
+    def tz
+      value('TZ')
+    end
+
+    # All TZ values, see #tz.
+    def timezones
+      values('TZ')
     end
 
     # Return an Array of KEY Line#value, or yield each Line#value if a block
@@ -1059,6 +1314,14 @@ module Vpim
         new(nil, card).make(&block)
       end
 
+      # Make a vCard 4.0 (RFC 6350). Like #make2, but defaults to (or
+      # requires) a VERSION:4.0 card. Values are encoded using the vCard 4.0
+      # types: BDAY/ANNIVERSARY as DATE-AND-OR-TIME, TEL URIs with
+      # VALUE=URI, GEO as a "geo:" URI, and so on.
+      def self.make4(card = Vpim::Vcard.create4, &block) # :yields: maker
+        new(nil, card).make(&block)
+      end
+
       # Deprecated, use #make2.
       #
       # If set, the FN field will be set to +full_name+. Otherwise, FN will
@@ -1083,7 +1346,19 @@ module Vpim
         unless @card['VERSION']
           @card << Vpim::DirectoryInfo::Field.create('VERSION', "3.0")
         end
+        if maker_profile == 40
+          Vpim::Vcard4.validate_maker!(@card)
+        end
         @card
+      end
+
+      def maker_profile #:nodoc:
+        if @card.respond_to?(:profile)
+          @card.profile
+        else
+          f = @card.field('VERSION')
+          f ? Vpim::Vcard.version_to_profile(f.value_raw) : nil
+        end
       end
 
       private
@@ -1144,7 +1419,7 @@ module Vpim
           line.name == 'N'
         end
 
-        @card << x.encode
+        @card << x.encode(maker_profile || 30)
         @card << x.encode_fn
 
         self
@@ -1156,7 +1431,7 @@ module Vpim
       def add_addr # :yield: address
         x = Vpim::Vcard::Address.new
         yield x
-        @card << x.encode
+        @card << x.encode(maker_profile || 30)
         self
       end
 
@@ -1165,7 +1440,13 @@ module Vpim
       # The block is optional, its only necessary if you want to specify
       # the optional attributes.
       def add_tel(number) # :yield: tel
+        number = number.to_s
         x = Vpim::Vcard::Telephone.new(number)
+        if number.downcase.index('tel:') == 0
+          x.value_type = 'uri'
+        elsif maker_profile == 40
+          x.value_type = 'text'
+        end
         if block_given?
           yield x
         end
@@ -1202,11 +1483,33 @@ module Vpim
       # Warning: It may confuse both humans and software if you add multiple
       # birthdays.
       def birthday=(birthday)
-        if !birthday.respond_to? :month
-          raise ArgumentError, 'birthday must be a date or time object.'
-        end
         delete_if { |l| l.name == 'BDAY' }
-        @card << Vpim::DirectoryInfo::Field.create( 'BDAY', birthday );
+        @card << Vpim::Vcard4.encode_datetime_field('BDAY', birthday, maker_profile || 30)
+      end
+
+      # Add an ANNIVERSARY field (vCard 4.0). +anniversary+ may be a Date,
+      # Time/DateTime, a Vpim::Vcard4::DateAndOrTime (for reduced-precision
+      # values such as a month/day), or a String for VALUE=TEXT.
+      def anniversary=(anniversary)
+        delete_if { |l| l.name == 'ANNIVERSARY' }
+        @card << Vpim::Vcard4.encode_datetime_field('ANNIVERSARY', anniversary, maker_profile || 30)
+      end
+
+      # Add a GEO field. In vCard 4.0 mode +geo+ is emitted as a geo: URI
+      # (RFC 6350 6.5.2). +geo+ may be an Array of two Numeric values
+      # ([latitude, longitude]), a Vpim::Vcard4::Geo, or a String URI.
+      def add_geo(geo)
+        @card << Vpim::Vcard4.encode_geo_field(geo, maker_profile || 30)
+        self
+      end
+
+      # Add a TZ field. In vCard 4.0 mode, strings are encoded as TEXT, a
+      # Vpim::Attachment::Uri or a string starting with a URI scheme is
+      # encoded as VALUE=URI, and a Vpim::Vcard4::UtcOffset (or
+      # DateAndOrTime holding an offset) is encoded as VALUE=UTC-OFFSET.
+      def add_tz(tz)
+        @card << Vpim::Vcard4.encode_tz_field(tz, maker_profile || 30)
+        self
       end
 
       # Add a note field, NOTE. The +note+ String can contain newlines, they
@@ -1429,3 +1732,4 @@ module Vpim
   end
 end
 
+require 'vpim/vcard4'
